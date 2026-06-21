@@ -1,0 +1,61 @@
+========================================
+Codex Bot - Go言語インストールガイド
+========================================
+
+Go言語がインストールされていない場合の手順:
+
+【方法1: 公式インストーラー（推奨）】
+1. ブラウザで以下にアクセス:
+   https://go.dev/dl/
+
+2. "Download Go for Windows" セクションから
+   .msiファイルをダウンロード
+
+3. ダウンロードした.msiファイルを実行
+
+4. インストールウィザードに従ってインストール
+   （デフォルト設定で問題ありません）
+
+5. PowerShellを再起動
+
+6. インストール確認:
+   go version
+
+【方法2: Chocolateyを使用】
+1. Chocolateyがインストールされている場合:
+   choco install golang -y
+
+2. PowerShellを再起動
+
+【方法3: Scoopを使用】
+1. Scoopがインストールされている場合:
+   scoop install go
+
+2. PowerShellを再起動
+
+========================================
+インストール後の確認
+========================================
+
+PowerShellで以下を実行:
+
+go version
+
+正常にインストールされていれば、バージョン情報が表示されます。
+
+例:
+go version go1.21.0 windows/amd64
+
+========================================
+次のステップ
+========================================
+
+1. 環境変数を設定:
+   $env:LINE_CHANNEL_SECRET = "your_secret"
+   $env:LINE_CHANNEL_ACCESS_TOKEN = "your_token"
+   $env:OPENAI_API_KEY = "sk-your-key"
+
+2. サーバーを起動:
+   go run main.go webhook_template.go
+
+========================================
