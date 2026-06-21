@@ -84,7 +84,7 @@ def main() -> int:
     os.environ["LINEJS_PERSONAL_AUTO_REPLY"] = "1"
     os.environ["LINEJS_PERSONAL_AUTO_REPLY_TRIGGERS"] = "#はくあ,#hermesagent"
     os.environ["LINEJS_PERSONAL_AUTO_REPLY_ONLY_GROUPS"] = "1"
-    os.environ["LINEJS_PERSONAL_AUTO_REPLY_COOLDOWN_MS"] = "120000"
+    os.environ["LINEJS_PERSONAL_AUTO_REPLY_COOLDOWN_MS"] = "5000"
     os.environ["LINEJS_PERSONAL_AUTO_REPLY_WEBHOOK"] = REPLY_URL
     os.environ["LINEJS_PERSONAL_AUTO_REPLY_WEBHOOK_TIMEOUT_MS"] = "90000"
     # Restrict Hakua auto-replies/admin reactions to approved groups only.
