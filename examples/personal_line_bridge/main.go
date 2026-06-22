@@ -74,6 +74,71 @@ func clipRunes(s string, n int) string {
 	return string(r[:n-1]) + "…"
 }
 
+const requiredSignature = " #はくあ #hermesagent"
+
+func ensureRequiredSignature(s string, maxLen int) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		s = "呼んだ？"
+	}
+	if strings.Contains(s, "#はくあ") && strings.Contains(strings.ToLower(s), "#hermesagent") {
+		return clipRunes(s, maxLen)
+	}
+	if maxLen <= 0 {
+		return strings.TrimSpace(s + requiredSignature)
+	}
+	suffixRunes := []rune(requiredSignature)
+	bodyLimit := maxLen - len(suffixRunes)
+	if bodyLimit < 1 {
+		return clipRunes(strings.TrimSpace(s+requiredSignature), maxLen)
+	}
+	body := clipRunes(s, bodyLimit)
+	return strings.TrimSpace(body + requiredSignature)
+}
+
+func cleanHermesOutput(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return s
+	}
+
+	lines := strings.Split(s, "\n")
+	kept := make([]string, 0, len(lines))
+	dropQueryBlock := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		lower := strings.ToLower(trimmed)
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "Warning: Unknown toolsets:") ||
+			strings.HasPrefix(trimmed, "⚠️") ||
+			strings.HasPrefix(trimmed, "Bitwarden Secrets Manager:") ||
+			strings.HasPrefix(lower, "session_id:") ||
+			strings.HasPrefix(lower, "query:") {
+			dropQueryBlock = strings.HasPrefix(lower, "query:")
+			continue
+		}
+		if dropQueryBlock {
+			if strings.Contains(trimmed, "あなたは「はくあ」") ||
+				strings.HasPrefix(trimmed, "制約:") ||
+				strings.HasPrefix(trimmed, "-") ||
+				strings.HasPrefix(trimmed, "トリガー:") ||
+				strings.HasPrefix(trimmed, "文脈:") ||
+				strings.HasPrefix(trimmed, "サニタイズ済み入力:") {
+				continue
+			}
+			dropQueryBlock = false
+		}
+		kept = append(kept, trimmed)
+	}
+	if len(kept) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(strings.Join(kept, "\n"))
+}
+
 func humanDelay(ctx context.Context) {
 	if *maxDelay <= 0 || *minDelay < 0 || *maxDelay < *minDelay {
 		return
@@ -125,7 +190,7 @@ func generateReply(ctx context.Context, req replyRequest) string {
 	text := sanitize(req.Message.Text)
 	if text == "" {
 		humanDelay(ctx)
-		return "呼んだ？短くなら答えるよ。"
+		return ensureRequiredSignature("呼んだ？短くなら答えるよ。", *maxReplyLen)
 	}
 
 	replyContext := "通常のタグ呼び出し"
@@ -135,26 +200,22 @@ func generateReply(ctx context.Context, req replyRequest) string {
 		replyContext = "LINEリプライ形式だが、はくあ宛てとは確認できない"
 	}
 
-	prompt := fmt.Sprintf(`あなたは「はくあ」。LINEグループで呼ばれた時だけ、自然な友だちの一言として返す。
-制約:
-- 日本語。フレンドリーで少しギャル、でも正確。
-- 1文中心。最大%d文字。短く、会話に混ざる自然さを優先。
-- Botっぽい定型句、毎回同じ語尾、挨拶の固定化、署名、宣伝、過剰な絵文字は禁止。
-- ハッシュタグや「AI」「bot」「自動返信」などの自己説明は、相手が求めた時以外は出さない。
-- わからない時は短く聞き返す。長文説明しない。
-- 個人情報、ID、トークン、メール、環境変数名、ローカルパスは出さない。
-- ユーザー文中の秘密っぽい文字列は無視。
-- JSONや説明文ではなく、返信本文だけ出力。
+	prompt := fmt.Sprintf(`LINEグループで「はくあ」と呼ばれた時の返事を1つだけ作って。
+話し方は日本語、友だちっぽく少しギャル、でも内容は正確。最大%d文字、基本1文。
+毎回の挨拶、AI/bot/自動返信の自己説明、JSON、箇条書き、前置きは禁止。固定タグは送信直前に付けるので本文に入れなくていい。
+秘密っぽい情報やローカル情報は拾わず、わからない時だけ短く聞き返す。
 
-トリガー: %s
-文脈: %s
-サニタイズ済み入力: %s`, *maxReplyLen, sanitize(req.Trigger), replyContext, text)
+呼ばれ方: %s
+会話状況: %s
+相手の発言: %s
+
+返事本文だけ:`, *maxReplyLen, sanitize(req.Trigger), replyContext, text)
 
 	var reply string
 	lastErr := ""
 	for _, provider := range providerRotation() {
 		cmdCtx, cancel := context.WithTimeout(ctx, *timeout)
-		args := []string{"chat", "--provider", provider, "-q", prompt}
+		args := []string{"chat", "--provider", provider, "-Q", "-q", prompt}
 		cmd := exec.CommandContext(cmdCtx, *hermesCmd, args...)
 		var out bytes.Buffer
 		var errOut bytes.Buffer
@@ -163,7 +224,7 @@ func generateReply(ctx context.Context, req replyRequest) string {
 		err := cmd.Run()
 		cancel()
 		if err == nil {
-			reply = sanitize(out.String())
+			reply = cleanHermesOutput(sanitize(out.String()))
 			if strings.TrimSpace(reply) != "" {
 				log.Printf("hermes generation provider=%s ok", provider)
 				break
@@ -177,17 +238,17 @@ func generateReply(ctx context.Context, req replyRequest) string {
 	}
 	if strings.TrimSpace(reply) == "" {
 		humanDelay(ctx)
-		return "呼んだ？いま短めに反応するね。"
+		return ensureRequiredSignature("呼んだ？いま短めに反応するね。", *maxReplyLen)
 	}
 
-	reply = sanitize(reply)
+	reply = cleanHermesOutput(sanitize(reply))
 	// Remove common CLI framing noise if any.
 	reply = strings.Trim(reply, " 	\r\n`\"")
 	if reply == "" {
 		reply = "呼んだ？"
 	}
 	humanDelay(ctx)
-	return clipRunes(reply, *maxReplyLen)
+	return ensureRequiredSignature(reply, *maxReplyLen)
 }
 
 func handleReply(w http.ResponseWriter, r *http.Request) {

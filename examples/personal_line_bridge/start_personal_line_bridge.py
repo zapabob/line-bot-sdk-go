@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -17,6 +18,10 @@ REPLY_URL = "http://127.0.0.1:9102/reply"
 HEALTH_URL = "http://127.0.0.1:9102/health"
 PLUGIN_CORE = Path.home() / ".hermes" / "plugins" / "line-personal-bridge" / "core.py"
 HERMES_ENV = Path.home() / ".hermes" / ".env"
+TAILSCALE_SERVE_ROUTES = {
+    "/personal-line-health": HEALTH_URL,
+    "/personal-line-reply": REPLY_URL,
+}
 
 
 def load_dotenv(path: Path) -> None:
@@ -67,6 +72,82 @@ def start_reply_server() -> None:
     print(f"reply_server=unhealthy log={log_path}")
 
 
+def _tailscale_exe() -> str | None:
+    configured = os.environ.get("TAILSCALE_EXE")
+    if configured:
+        return configured
+    return shutil.which("tailscale.exe") or shutil.which("tailscale")
+
+
+def _tailscale_serve_status(exe: str) -> dict:
+    proc = subprocess.run(
+        [exe, "serve", "status", "--json"],
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=10,
+    )
+    if proc.returncode != 0:
+        return {"ok": False, "error": proc.stdout.strip()}
+    try:
+        return {"ok": True, "status": json.loads(proc.stdout or "{}")}
+    except json.JSONDecodeError as exc:
+        return {"ok": False, "error": f"invalid JSON: {exc}: {proc.stdout[:500]}"}
+
+
+def _serve_has_route(status: dict, path: str, target: str) -> bool:
+    for web in (status.get("Web") or {}).values():
+        handlers = web.get("Handlers") if isinstance(web, dict) else None
+        handler = handlers.get(path) if isinstance(handlers, dict) else None
+        if isinstance(handler, dict) and handler.get("Proxy") == target:
+            return True
+    return False
+
+
+def ensure_tailscale_serve() -> None:
+    """Expose the local Hakua reply server on the tailnet at boot/logon.
+
+    This is idempotent and intentionally only publishes the two personal LINE
+    reply endpoints, leaving any existing Tailscale Serve routes untouched.
+    """
+    exe = _tailscale_exe()
+    if not exe:
+        print("tailscale_serve=skipped reason=tailscale_not_found")
+        return
+    before = _tailscale_serve_status(exe)
+    if not before.get("ok"):
+        print(f"tailscale_serve=skipped reason={before.get('error')}")
+        return
+    status = before.get("status") or {}
+    changed = []
+    for path, target in TAILSCALE_SERVE_ROUTES.items():
+        if _serve_has_route(status, path, target):
+            continue
+        proc = subprocess.run(
+            [exe, "serve", "--bg", "--yes", "--set-path", path, target],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+        )
+        if proc.returncode == 0:
+            changed.append(path)
+        else:
+            print(f"tailscale_serve=route_failed path={path} output={proc.stdout.strip()}")
+    after = _tailscale_serve_status(exe)
+    final_status = after.get("status") if after.get("ok") else {}
+    ok = all(_serve_has_route(final_status or {}, path, target) for path, target in TAILSCALE_SERVE_ROUTES.items())
+    print(json.dumps({
+        "tailscale_serve_ok": ok,
+        "changed_paths": changed,
+        "routes": TAILSCALE_SERVE_ROUTES,
+    }, ensure_ascii=False))
+
+
 def load_core():
     spec = importlib.util.spec_from_file_location("line_personal_bridge_core", PLUGIN_CORE)
     if spec is None or spec.loader is None:
@@ -81,25 +162,39 @@ def main() -> int:
 
     # Non-secret runtime policy. Credentials are not embedded in this script.
     os.environ.setdefault("LINEJS_PERSONAL_USE_LINE_PERSONAL_FALLBACK", "1")
+    os.environ["LINEJS_PERSONAL_LOGIN_MODE"] = "email_password"
+    os.environ["LINEJS_PERSONAL_DISABLE_QR"] = "1"
     os.environ["LINEJS_PERSONAL_AUTO_REPLY"] = "1"
     os.environ["LINEJS_PERSONAL_AUTO_REPLY_TRIGGERS"] = "#はくあ,#hermesagent"
     os.environ["LINEJS_PERSONAL_AUTO_REPLY_ONLY_GROUPS"] = "1"
     os.environ["LINEJS_PERSONAL_AUTO_REPLY_COOLDOWN_MS"] = "5000"
     os.environ["LINEJS_PERSONAL_AUTO_REPLY_WEBHOOK"] = REPLY_URL
     os.environ["LINEJS_PERSONAL_AUTO_REPLY_WEBHOOK_TIMEOUT_MS"] = "90000"
-    # Restrict Hakua auto-replies/admin reactions to approved groups only.
-    # 日本メンタル(雑談/通話グル), 生成AI、LLMなど
-    os.environ["LINEJS_PERSONAL_ALLOWED_GROUP_MIDS"] = "c0431273df4f01cbc7afbb23bf4624b85,c3c47bde1c8b6bdb8ca0ddaab9f2089d7"
+    # Restrict Hakua auto-replies/admin reactions to approved groups only when
+    # LINEJS_PERSONAL_ALLOWED_GROUP_MIDS is provided by the private environment.
+    os.environ.setdefault("LINEJS_PERSONAL_ALLOWED_GROUP_MIDS", "")
 
     start_reply_server()
+    ensure_tailscale_serve()
 
     core = load_core()
     current = core.status_payload({})
     current_http = current.get("bridge", {}).get("http", {})
     auto_reply = current_http.get("autoReply") if isinstance(current_http, dict) else {}
+    desired_group_mids = [
+        mid.strip()
+        for mid in os.environ.get("LINEJS_PERSONAL_ALLOWED_GROUP_MIDS", "").split(",")
+        if mid.strip()
+    ]
+    desired_triggers = ["#はくあ", "#hermesagent"]
+    current_groups = current_http.get("allowedGroupMids") if isinstance(current_http, dict) else []
+    current_triggers = auto_reply.get("triggers") if isinstance(auto_reply, dict) else []
     needs_restart = (
-        current_http.get("loginState") == "error"
+        current_http.get("loginState") in {"error", None}
         or not (isinstance(auto_reply, dict) and auto_reply.get("webhookConfigured"))
+        or auto_reply.get("cooldownMs") != 5000
+        or current_groups != desired_group_mids
+        or current_triggers != desired_triggers
     )
     result = core.start_payload({"force": needs_restart, "wait_seconds": 15})
     print(json.dumps({
